@@ -11,7 +11,7 @@
 - **CRITICAL:** Never run `ufbt cli` as an automated agent command, as it opens an interactive serial session that blocks the terminal indefinitely.
 
 ## Flipper Zero Coding Rules & Guardrails
-1. **Verify SDK Headers First:** Never guess Flipper OS function prototypes, enum names, or callback signatures. Always search `./sdk_headers/` (e.g., `./sdk_headers/f7_sdk/`) to verify exact parameter orders and types before writing code.
+1. **Verify SDK Headers First:** Never guess Flipper OS function prototypes, enum names, or callback signatures. Always search `~/.ufbt/current/sdk_headers/` (e.g., `~/.ufbt/current/sdk_headers/f7_sdk/`) to verify exact parameter orders and types before writing code.
 2. **C++ Compatibility:** 
    - Keep `extern "C"` on the `flipa55_main` entry point.
    - Explicitly cast `void*` returns (such as `malloc` and `furi_record_open`) to their target pointer types.

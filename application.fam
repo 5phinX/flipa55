@@ -1,0 +1,16 @@
+App(
+    appid="flipa55",
+    name="Flipa55",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flipa55_main",
+    cdefines=["APP_FLIPA55"],
+    requires=[
+        "gui",
+        "lfrfid",
+        "storage",
+        "dialogs",
+    ],
+    stack_size=2 * 1024,
+    order=20,
+    fap_category="Misc",
+)

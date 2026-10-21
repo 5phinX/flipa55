@@ -164,8 +164,8 @@ static void save_new_file(AppState *app) {
     // Prepare plaintext
     plaintext[16] = strlen(app->password);
     strcpy((char*)&plaintext[17], app->password);
-    if ( (plaintext[16] % 16) == 0 ) cipherBlocks = plaintext[16] / 16;
-    else cipherBlocks = (plaintext[16] / 16) + 1;
+    if ( ((plaintext[16]+1) % 16) == 0 ) cipherBlocks = (plaintext[16]+1) / 16;
+    else cipherBlocks = ((plaintext[16]+1) / 16) + 1;
 
     // Encrypt file contents
     encrypt_cfb128(app->key, plaintext, ciphertext, cipherBlocks, 256);
@@ -173,7 +173,7 @@ static void save_new_file(AppState *app) {
     // Write username in plaintext
     storage_file_write(fout, app->username, strlen(app->username));
     storage_file_write(fout, "\n", 1);
-    storage_file_write(fout, ciphertext, cipherBlocks*16);
+    storage_file_write(fout, ciphertext, (cipherBlocks+1)*16);
 
     file_op_success = true;
   } else {
@@ -216,10 +216,10 @@ static void decrypt_selected_file(AppState* app) {
       cipherBlocks = storage_file_read(fin, ciphertext, 144);
       cipherBlocks = cipherBlocks/16;
 
-      decrypt_cfb128(app->key, ciphertext, plaintext, cipherBlocks, 256);
+      decrypt_cfb128(app->key, ciphertext, plaintext, cipherBlocks-1, 256);
 
       memset(app->password, 0, sizeof(app->password));
-      strncpy( app->password, (const char*)&ciphertext[1], ciphertext[0] );
+      strncpy( app->password, (const char*)&plaintext[1], plaintext[0] );
 
       file_op_success = true;
     } else {
@@ -237,7 +237,7 @@ static void decrypt_selected_file(AppState* app) {
   else {
     FURI_LOG_I("Flipa55", "Username: %s", app->username);
     FURI_LOG_I("Flipa55", "Password: %s", app->password);
-    view_dispatcher_send_custom_event(app->view_dispatcher, 200);
+    view_dispatcher_send_custom_event(app->view_dispatcher, 201);
   }
 }
 
@@ -333,6 +333,13 @@ static bool custom_event_callback(void* context, uint32_t event) {
       return true;
       break;
 
+    // Custom code for management menu
+    case 201:
+      app->current_view = ViewManageMenu;
+      view_dispatcher_switch_to_view(app->view_dispatcher, ViewManageMenu);
+      return true;
+      break;
+
     // File name has been entered
     case 300:
       memset(app->username, 0, sizeof(app->username));
@@ -397,8 +404,7 @@ static bool navigation_event_callback(void* context) {
       break;
     case ViewTextInput:
     case ViewStatusWidget:
-      app->current_view = ViewManageMenu;
-      view_dispatcher_switch_to_view(app->view_dispatcher, ViewManageMenu);
+      view_dispatcher_send_custom_event(app->view_dispatcher, 201);
       break;
     case ViewLoading:
       // Ignore back button while waiting

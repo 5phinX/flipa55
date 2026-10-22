@@ -71,6 +71,7 @@ typedef enum {
   MenuEditFile,
   MenuRemoveFile,
   MenuBatchEncrypt,
+  MenuTypeKey,
   MenuTypeUsername,
   MenuTypePassword,
 } MenuIndex;
@@ -373,6 +374,15 @@ static void hid_type_string(AppState* app, const char* text) {
     furi_delay_ms(app->key_delay_ms);
   }
   furi_hal_hid_kb_release_all();
+}
+
+static void type_encryption_key_hex(AppState* app) {
+  char hex_key[sizeof(app->key) * 2 + 1];
+  for ( size_t i = 0; i < sizeof(app->key); i++ ) {
+    snprintf(&hex_key[i * 2], 3, "%02X", app->key[i]);
+  }
+  hex_key[sizeof(app->key) * 2] = '\0';
+  hid_type_string(app, hex_key);
 }
 
 static void generate_random_em4100_data(AppState* app) {
@@ -957,6 +967,11 @@ static bool custom_event_callback(void* context, uint32_t event) {
       return true;
       break;
 
+    case MenuTypeKey:
+      type_encryption_key_hex(app);
+      return true;
+      break;
+
     case MenuTypeUsername:
       hid_type_string(app, app->username);
       return true;
@@ -969,9 +984,12 @@ static bool custom_event_callback(void* context, uint32_t event) {
 
     // Custom code for return to main menu
     case 100:
-      // Stop the worker and open the management menu
+      // Stop the worker and return to the init menu
       lfrfid_worker_stop(app->rfid_worker);
       lfrfid_worker_stop_thread(app->rfid_worker);
+      if ( furi_hal_usb_get_config() == &usb_hid && app->usb_mode_prev != NULL ) {
+        furi_hal_usb_set_config(app->usb_mode_prev, NULL);
+      }
 
       app->current_view = ViewInitmenu;
       view_dispatcher_switch_to_view(app->view_dispatcher, ViewInitmenu);
@@ -988,6 +1006,11 @@ static bool custom_event_callback(void* context, uint32_t event) {
     case 200:
       lfrfid_worker_stop(app->rfid_worker);
       lfrfid_worker_stop_thread(app->rfid_worker);
+      if ( furi_hal_usb_get_config() != &usb_hid ) {
+        app->usb_mode_prev = furi_hal_usb_get_config();
+        furi_hal_usb_unlock();
+        furi_hal_usb_set_config(&usb_hid, NULL);
+      }
       app->current_view = ViewManageMenu;
       view_dispatcher_switch_to_view(app->view_dispatcher, ViewManageMenu);
       return true;
@@ -995,9 +1018,6 @@ static bool custom_event_callback(void* context, uint32_t event) {
 
     // Custom code for management menu
     case 201:
-      if ( furi_hal_usb_get_config() == &usb_hid && app->usb_mode_prev != NULL ) {
-        furi_hal_usb_set_config(app->usb_mode_prev, NULL);
-      }
       app->current_view = ViewManageMenu;
       view_dispatcher_switch_to_view(app->view_dispatcher, ViewManageMenu);
       return true;
@@ -1277,6 +1297,7 @@ extern "C" int32_t flipa55_main() {
   submenu_add_item(app->managemenu, "Edit password file", MenuEditFile, menu_callback, app->view_dispatcher);
   submenu_add_item(app->managemenu, "Remove password file", MenuRemoveFile, menu_callback, app->view_dispatcher);
   submenu_add_item(app->managemenu, "Batch encrypt files", MenuBatchEncrypt, menu_callback, app->view_dispatcher);
+  submenu_add_item(app->managemenu, "Type encryption key", MenuTypeKey, menu_callback, app->view_dispatcher);
 
   // Allocate the RFID dictionary and worker
   app->rfid_dict = protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax);

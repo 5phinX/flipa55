@@ -675,6 +675,7 @@ static void batch_encrypt_files(AppState* app) {
       continue;
     }
 
+    bool write_ok = false;
     File* fout = storage_file_alloc(storage);
     if ( storage_file_open(fout, furi_string_get_cstr(dst_path), FSAM_WRITE, FSOM_CREATE_NEW) ) {
       furi_hal_random_fill_buf(plaintext, 16);
@@ -688,16 +689,20 @@ static void batch_encrypt_files(AppState* app) {
 
       size_t u_bytes = strlen(app->username);
       size_t c_bytes = (cipherBlocks + 1) * 16;
-      if ( storage_file_write(fout, app->username, u_bytes) != u_bytes ||
-           storage_file_write(fout, "\n", 1) != 1 ||
-           storage_file_write(fout, ciphertext, c_bytes) != c_bytes ) {
-        app->batch_failed_count++;
+      if ( storage_file_write(fout, app->username, u_bytes) == u_bytes &&
+           storage_file_write(fout, "\n", 1) == 1 &&
+           storage_file_write(fout, ciphertext, c_bytes) == c_bytes ) {
+        write_ok = true;
       }
-    } else {
-      app->batch_failed_count++;
     }
     storage_file_close(fout);
     storage_file_free(fout);
+
+    if ( write_ok ) {
+      storage_common_remove(storage, furi_string_get_cstr(src_path));
+    } else {
+      app->batch_failed_count++;
+    }
   }
 
   furi_string_free(src_path);

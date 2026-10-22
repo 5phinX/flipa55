@@ -70,6 +70,7 @@ typedef enum {
   MenuCopyFile,
   MenuEditFile,
   MenuRemoveFile,
+  MenuBatchEncrypt,
   MenuTypeUsername,
   MenuTypePassword,
 } MenuIndex;
@@ -115,6 +116,8 @@ typedef struct {
   char username[128];
   char password[127];
   bool is_editing_file;
+  uint32_t batch_failed_count;
+  char status_msg[96];
 
   FuriHalUsbInterface* usb_mode_prev;
 } AppState;
@@ -122,6 +125,7 @@ typedef struct {
 static void save_new_file(AppState* app);
 static void copy_selected_file(AppState* app);
 static void remove_selected_file(AppState* app);
+static void batch_encrypt_files(AppState* app);
 static bool load_username_from_file(AppState* app);
 static void decrypt_selected_file(AppState* app);
 
@@ -582,6 +586,129 @@ static void remove_selected_file(AppState* app) {
   else view_dispatcher_send_custom_event(app->view_dispatcher, 303);
 }
 
+// Batch encrypt all plaintext files in /ext/flipa55/plain into /ext/flipa55/data
+static void batch_encrypt_files(AppState* app) {
+  Storage* storage = (Storage*)furi_record_open(RECORD_STORAGE);
+  unsigned char ciphertext[144];
+  unsigned char plaintext[144];
+  unsigned int cipherBlocks;
+
+  app->batch_failed_count = 0;
+
+  app->current_view = ViewLoading;
+  view_dispatcher_switch_to_view(app->view_dispatcher, ViewLoading);
+
+  storage_simply_mkdir(storage, "/ext/flipa55");
+  storage_simply_mkdir(storage, "/ext/flipa55/data");
+
+  File* dir = storage_file_alloc(storage);
+  if ( !storage_dir_open(dir, "/ext/flipa55/plain") ) {
+    storage_dir_close(dir);
+    storage_file_free(dir);
+    furi_record_close(RECORD_STORAGE);
+    view_dispatcher_send_custom_event(app->view_dispatcher, 303);
+    return;
+  }
+
+  FileInfo fileinfo;
+  char entry_name[64];
+  FuriString* src_path = furi_string_alloc();
+  FuriString* dst_path = furi_string_alloc();
+
+  while ( storage_dir_read(dir, &fileinfo, entry_name, sizeof(entry_name)) ) {
+    if ( file_info_is_dir(&fileinfo) || entry_name[0] == '.' ) {
+      continue;
+    }
+
+    furi_string_printf(src_path, "/ext/flipa55/plain/%s", entry_name);
+    furi_string_printf(dst_path, "/ext/flipa55/data/%s", entry_name);
+
+    // Skip already existing files in /ext/flipa55/data
+    if ( storage_common_exists(storage, furi_string_get_cstr(dst_path)) ) {
+      app->batch_failed_count++;
+      continue;
+    }
+
+    bool read_ok = false;
+    memset(app->username, 0, sizeof(app->username));
+    memset(app->password, 0, sizeof(app->password));
+
+    File* fin = storage_file_alloc(storage);
+    if ( storage_file_open(fin, furi_string_get_cstr(src_path), FSAM_READ, FSOM_OPEN_EXISTING) ) {
+      if ( storage_file_size(fin) != 0 ) {
+        size_t u_len = 0;
+        char ch = 0;
+        bool found_newline = false;
+        while ( storage_file_read(fin, &ch, 1) == 1 ) {
+          if ( ch == '\n' ) {
+            found_newline = true;
+            break;
+          }
+          if ( ch != '\r' && u_len < sizeof(app->username) - 1 ) {
+            app->username[u_len++] = ch;
+          }
+        }
+        app->username[u_len] = '\0';
+
+        if ( found_newline && u_len > 0 ) {
+          size_t p_len = 0;
+          while ( storage_file_read(fin, &ch, 1) == 1 ) {
+            if ( ch == '\n' ) {
+              break;
+            }
+            if ( ch != '\r' && p_len < sizeof(app->password) - 1 ) {
+              app->password[p_len++] = ch;
+            }
+          }
+          app->password[p_len] = '\0';
+          if ( p_len > 0 ) {
+            read_ok = true;
+          }
+        }
+      }
+    }
+    storage_file_close(fin);
+    storage_file_free(fin);
+
+    if ( !read_ok ) {
+      app->batch_failed_count++;
+      continue;
+    }
+
+    File* fout = storage_file_alloc(storage);
+    if ( storage_file_open(fout, furi_string_get_cstr(dst_path), FSAM_WRITE, FSOM_CREATE_NEW) ) {
+      furi_hal_random_fill_buf(plaintext, 16);
+
+      plaintext[16] = strlen(app->password);
+      strcpy((char*)&plaintext[17], app->password);
+      if ( ((plaintext[16] + 1) % 16) == 0 ) cipherBlocks = (plaintext[16] + 1) / 16;
+      else cipherBlocks = ((plaintext[16] + 1) / 16) + 1;
+
+      encrypt_cfb128(app->key, plaintext, ciphertext, cipherBlocks, 256);
+
+      size_t u_bytes = strlen(app->username);
+      size_t c_bytes = (cipherBlocks + 1) * 16;
+      if ( storage_file_write(fout, app->username, u_bytes) != u_bytes ||
+           storage_file_write(fout, "\n", 1) != 1 ||
+           storage_file_write(fout, ciphertext, c_bytes) != c_bytes ) {
+        app->batch_failed_count++;
+      }
+    } else {
+      app->batch_failed_count++;
+    }
+    storage_file_close(fout);
+    storage_file_free(fout);
+  }
+
+  furi_string_free(src_path);
+  furi_string_free(dst_path);
+  storage_dir_close(dir);
+  storage_file_free(dir);
+  furi_record_close(RECORD_STORAGE);
+
+  view_dispatcher_send_custom_event(app->view_dispatcher, 314);
+}
+
 // Read only the plaintext username line from the selected file without decrypting
 static bool load_username_from_file(AppState* app) {
   Storage* storage = (Storage*)furi_record_open(RECORD_STORAGE);
@@ -820,6 +947,11 @@ static bool custom_event_callback(void* context, uint32_t event) {
       return true;
       break;
 
+    case MenuBatchEncrypt:
+      batch_encrypt_files(app);
+      return true;
+      break;
+
     case MenuTypeUsername:
       hid_type_string(app, app->username);
       return true;
@@ -931,6 +1063,21 @@ static bool custom_event_callback(void* context, uint32_t event) {
     case 313:
       widget_reset(app->status_widget);
       widget_add_text_box_element(app->status_widget, 0, 0, 128, 64, AlignCenter, AlignCenter, "File removed\nPress back to return to menu.", true);
+
+      app->current_view = ViewStatusWidget;
+      view_dispatcher_switch_to_view(app->view_dispatcher, ViewStatusWidget);
+      return true;
+      break;
+
+    // Batch encryption finished
+    case 314:
+      snprintf(
+          app->status_msg,
+          sizeof(app->status_msg),
+          "Batch encrypt done\nFailed: %lu\nPress back to return.",
+          (unsigned long)app->batch_failed_count);
+      widget_reset(app->status_widget);
+      widget_add_text_box_element(app->status_widget, 0, 0, 128, 64, AlignCenter, AlignCenter, app->status_msg, true);
 
       app->current_view = ViewStatusWidget;
       view_dispatcher_switch_to_view(app->view_dispatcher, ViewStatusWidget);
@@ -1124,6 +1271,7 @@ extern "C" int32_t flipa55_main() {
   submenu_add_item(app->managemenu, "Copy password file", MenuCopyFile, menu_callback, app->view_dispatcher);
   submenu_add_item(app->managemenu, "Edit password file", MenuEditFile, menu_callback, app->view_dispatcher);
   submenu_add_item(app->managemenu, "Remove password file", MenuRemoveFile, menu_callback, app->view_dispatcher);
+  submenu_add_item(app->managemenu, "Batch encrypt files", MenuBatchEncrypt, menu_callback, app->view_dispatcher);
 
   // Allocate the RFID dictionary and worker
   app->rfid_dict = protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax);

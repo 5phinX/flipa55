@@ -16,6 +16,17 @@
 #include <dialogs/dialogs.h>
 #include <flipper_format/flipper_format.h>
 #include <toolbox/path.h>
+#include <nfc/nfc.h>
+#include <nfc/nfc_scanner.h>
+#include <nfc/nfc_poller.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a_poller.h>
+#include <nfc/protocols/mf_ultralight/mf_ultralight.h>
+#include <nfc/protocols/mf_ultralight/mf_ultralight_poller.h>
+#include <nfc/protocols/mf_classic/mf_classic.h>
+#include <nfc/protocols/mf_classic/mf_classic_poller.h>
+#include <nfc/protocols/iso15693_3/iso15693_3.h>
+#include <nfc/protocols/iso15693_3/iso15693_3_poller.h>
 #include <string.h>
 
 #include "sha2.h"
@@ -64,6 +75,8 @@ typedef enum {
 typedef enum {
   MenuScanRFID,
   MenuCreateRFID,
+  MenuScanNFC,
+  MenuCreateNFC,
   MenuSettings,
   MenuCreateFile,
   MenuOpenFile,
@@ -98,6 +111,15 @@ typedef struct {
   LFRFIDWorker* rfid_worker;
   ProtocolDict* rfid_dict;
   ProtocolId scanned_protocol;
+
+  // NFC state
+  Nfc* nfc;
+  NfcScanner* nfc_scanner;
+  NfcPoller* nfc_poller;
+  NfcProtocol nfc_protocol;
+  MfUltralightData* mf_ul_write_data;
+  bool nfc_is_writing;
+  uint8_t mfc_sector_idx;
 
   uint8_t random_data[5];
   uint8_t key[32];
@@ -432,6 +454,229 @@ static void rfid_write_callback(LFRFIDWorkerWriteResult result, void* context) {
   } else {
     view_dispatcher_send_custom_event(app->view_dispatcher, 101);
   }
+}
+
+static void stop_nfc(AppState* app) {
+  if ( app->nfc_poller != NULL ) {
+    nfc_poller_stop(app->nfc_poller);
+    nfc_poller_free(app->nfc_poller);
+    app->nfc_poller = NULL;
+  }
+  if ( app->nfc_scanner != NULL ) {
+    nfc_scanner_stop(app->nfc_scanner);
+    nfc_scanner_free(app->nfc_scanner);
+    app->nfc_scanner = NULL;
+  }
+}
+
+static void nfc_scanner_callback(NfcScannerEvent event, void* context) {
+  AppState* app = (AppState*)context;
+  if ( event.type == NfcScannerEventTypeDetected && event.data.protocol_num > 0 ) {
+    bool has_ul = false;
+    bool has_mfc = false;
+    bool has_iso15 = false;
+    bool has_iso14 = false;
+
+    for ( size_t i = 0; i < event.data.protocol_num; i++ ) {
+      NfcProtocol proto = event.data.protocols[i];
+      if ( proto == NfcProtocolMfUltralight ) {
+        has_ul = true;
+      } else if ( proto == NfcProtocolMfClassic ) {
+        has_mfc = true;
+      } else if ( proto == NfcProtocolIso15693_3 || proto == NfcProtocolSlix ) {
+        has_iso15 = true;
+      } else if ( proto == NfcProtocolIso14443_3a ) {
+        has_iso14 = true;
+      }
+    }
+
+    if ( has_ul ) {
+      app->nfc_protocol = NfcProtocolMfUltralight;
+      view_dispatcher_send_custom_event(app->view_dispatcher, 500);
+    } else if ( has_mfc ) {
+      app->nfc_protocol = NfcProtocolMfClassic;
+      view_dispatcher_send_custom_event(app->view_dispatcher, 500);
+    } else if ( !app->nfc_is_writing && has_iso15 ) {
+      app->nfc_protocol = NfcProtocolIso15693_3;
+      view_dispatcher_send_custom_event(app->view_dispatcher, 500);
+    } else if ( !app->nfc_is_writing && has_iso14 ) {
+      app->nfc_protocol = NfcProtocolIso14443_3a;
+      view_dispatcher_send_custom_event(app->view_dispatcher, 500);
+    } else if ( app->nfc_is_writing ) {
+      view_dispatcher_send_custom_event(app->view_dispatcher, 102);
+    }
+  }
+}
+
+static NfcCommand nfc_poller_callback(NfcGenericEvent event, void* context) {
+  AppState* app = (AppState*)context;
+  NfcCommand command = NfcCommandContinue;
+
+  if ( event.protocol == NfcProtocolMfUltralight ) {
+    MfUltralightPollerEvent* ul_event = (MfUltralightPollerEvent*)event.event_data;
+    if ( ul_event->type == MfUltralightPollerEventTypeRequestMode ) {
+      ul_event->data->poller_mode =
+          app->nfc_is_writing ? MfUltralightPollerModeWrite : MfUltralightPollerModeRead;
+    } else if ( ul_event->type == MfUltralightPollerEventTypeAuthRequest ) {
+      ul_event->data->auth_context.skip_auth = true;
+    } else if ( ul_event->type == MfUltralightPollerEventTypeReadSuccess ) {
+      if ( !app->nfc_is_writing ) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, 501);
+        command = NfcCommandStop;
+      }
+    } else if ( ul_event->type == MfUltralightPollerEventTypeRequestWriteData ) {
+      const MfUltralightData* tag_data =
+          (const MfUltralightData*)nfc_poller_get_data(app->nfc_poller);
+      mf_ultralight_copy(app->mf_ul_write_data, tag_data);
+      uint16_t end_page = mf_ultralight_get_write_end_page(app->mf_ul_write_data->type);
+      if ( end_page > MF_ULTRALIGHT_MAX_PAGE_NUM ) {
+        end_page = MF_ULTRALIGHT_MAX_PAGE_NUM;
+      }
+      for ( uint16_t p = 4; p < end_page; p++ ) {
+        furi_hal_random_fill_buf(app->mf_ul_write_data->page[p].data, MF_ULTRALIGHT_PAGE_SIZE);
+      }
+      ul_event->data->write_data = app->mf_ul_write_data;
+    } else if ( ul_event->type == MfUltralightPollerEventTypeWriteSuccess ) {
+      view_dispatcher_send_custom_event(app->view_dispatcher, 100);
+      command = NfcCommandStop;
+    } else if (
+        ul_event->type == MfUltralightPollerEventTypeWriteFail ||
+        ul_event->type == MfUltralightPollerEventTypeCardLocked ||
+        ul_event->type == MfUltralightPollerEventTypeCardMismatch ||
+        (app->nfc_is_writing && ul_event->type == MfUltralightPollerEventTypeReadFailed) ) {
+      view_dispatcher_send_custom_event(app->view_dispatcher, 102);
+      command = NfcCommandStop;
+    }
+  } else if ( event.protocol == NfcProtocolMfClassic ) {
+    MfClassicPollerEvent* mc_event = (MfClassicPollerEvent*)event.event_data;
+    if ( mc_event->type == MfClassicPollerEventTypeRequestMode ) {
+      mc_event->data->poller_mode.mode =
+          app->nfc_is_writing ? MfClassicPollerModeWrite : MfClassicPollerModeRead;
+      mc_event->data->poller_mode.data = NULL;
+      app->mfc_sector_idx = 0;
+    } else if ( mc_event->type == MfClassicPollerEventTypeRequestReadSector ) {
+      const MfClassicData* mfc_data = (const MfClassicData*)nfc_poller_get_data(app->nfc_poller);
+      uint8_t total_sectors = mf_classic_get_total_sectors_num(mfc_data->type);
+      if ( app->mfc_sector_idx < total_sectors ) {
+        mc_event->data->read_sector_request_data.sector_num = app->mfc_sector_idx++;
+        memset(mc_event->data->read_sector_request_data.key.data, 0xFF, MF_CLASSIC_KEY_SIZE);
+        mc_event->data->read_sector_request_data.key_type = MfClassicKeyTypeA;
+        mc_event->data->read_sector_request_data.key_provided = true;
+      } else {
+        mc_event->data->read_sector_request_data.key_provided = false;
+      }
+    } else if ( mc_event->type == MfClassicPollerEventTypeRequestSectorTrailer ) {
+      static const uint8_t default_trailer[MF_CLASSIC_BLOCK_SIZE] = {
+          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+          0xFF, 0x07, 0x80, 0x69,
+          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+      memcpy(
+          mc_event->data->sec_tr_data.sector_trailer.data,
+          default_trailer,
+          MF_CLASSIC_BLOCK_SIZE);
+      mc_event->data->sec_tr_data.sector_trailer_provided = true;
+    } else if ( mc_event->type == MfClassicPollerEventTypeRequestWriteBlock ) {
+      uint8_t blk = mc_event->data->write_block_data.block_num;
+      if ( blk == 0 || mf_classic_is_sector_trailer(blk) ) {
+        mc_event->data->write_block_data.write_block_provided = false;
+      } else {
+        furi_hal_random_fill_buf(
+            mc_event->data->write_block_data.write_block.data, MF_CLASSIC_BLOCK_SIZE);
+        mc_event->data->write_block_data.write_block_provided = true;
+      }
+    } else if ( mc_event->type == MfClassicPollerEventTypeSuccess ) {
+      view_dispatcher_send_custom_event(
+          app->view_dispatcher, app->nfc_is_writing ? 100 : 501);
+      command = NfcCommandStop;
+    } else if ( mc_event->type == MfClassicPollerEventTypeFail ) {
+      if ( app->nfc_is_writing ) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, 102);
+        command = NfcCommandStop;
+      } else {
+        command = NfcCommandReset;
+      }
+    }
+  } else if ( event.protocol == NfcProtocolIso15693_3 ) {
+    Iso15693_3PollerEvent* iso15_event = (Iso15693_3PollerEvent*)event.event_data;
+    if ( iso15_event->type == Iso15693_3PollerEventTypeReady ) {
+      view_dispatcher_send_custom_event(app->view_dispatcher, 501);
+      command = NfcCommandStop;
+    }
+  } else if ( event.protocol == NfcProtocolIso14443_3a ) {
+    Iso14443_3aPollerEvent* iso14_event = (Iso14443_3aPollerEvent*)event.event_data;
+    if ( iso14_event->type == Iso14443_3aPollerEventTypeReady ) {
+      view_dispatcher_send_custom_event(app->view_dispatcher, 501);
+      command = NfcCommandStop;
+    }
+  }
+
+  return command;
+}
+
+static void derive_nfc_key(AppState* app) {
+  if ( app->nfc_poller == NULL ) return;
+
+  sha256_initialize();
+  size_t uid_len = 0;
+
+  if ( app->nfc_protocol == NfcProtocolMfUltralight ) {
+    const MfUltralightData* ul_data =
+        (const MfUltralightData*)nfc_poller_get_data(app->nfc_poller);
+    const uint8_t* uid = mf_ultralight_get_uid(ul_data, &uid_len);
+    if ( uid != NULL && uid_len > 0 ) {
+      sha256_addData(uid, uid_len);
+    }
+    uint16_t end_page = mf_ultralight_get_write_end_page(ul_data->type);
+    if ( end_page > ul_data->pages_read ) {
+      end_page = ul_data->pages_read;
+    }
+    if ( end_page > 4 ) {
+      for ( uint16_t p = 4; p < end_page; p++ ) {
+        sha256_addData(ul_data->page[p].data, MF_ULTRALIGHT_PAGE_SIZE);
+      }
+    } else {
+      for ( uint16_t p = 0; p < ul_data->pages_read; p++ ) {
+        sha256_addData(ul_data->page[p].data, MF_ULTRALIGHT_PAGE_SIZE);
+      }
+    }
+  } else if ( app->nfc_protocol == NfcProtocolMfClassic ) {
+    const MfClassicData* mfc_data = (const MfClassicData*)nfc_poller_get_data(app->nfc_poller);
+    const uint8_t* uid = mf_classic_get_uid(mfc_data, &uid_len);
+    if ( uid != NULL && uid_len > 0 ) {
+      sha256_addData(uid, uid_len);
+    }
+    uint16_t total_blocks = mf_classic_get_total_block_num(mfc_data->type);
+    for ( uint16_t b = 1; b < total_blocks; b++ ) {
+      if ( !mf_classic_is_sector_trailer((uint8_t)b) &&
+           mf_classic_is_block_read(mfc_data, (uint8_t)b) ) {
+        sha256_addData(mfc_data->block[b].data, MF_CLASSIC_BLOCK_SIZE);
+      }
+    }
+  } else if ( app->nfc_protocol == NfcProtocolIso15693_3 ) {
+    const Iso15693_3Data* iso15_data =
+        (const Iso15693_3Data*)nfc_poller_get_data(app->nfc_poller);
+    const uint8_t* uid = iso15693_3_get_uid(iso15_data, &uid_len);
+    if ( uid != NULL && uid_len > 0 ) {
+      sha256_addData(uid, uid_len);
+    }
+    uint16_t block_count = iso15693_3_get_block_count(iso15_data);
+    uint8_t block_size = iso15693_3_get_block_size(iso15_data);
+    for ( uint16_t b = 0; b < block_count; b++ ) {
+      const uint8_t* blk = iso15693_3_get_block_data(iso15_data, (uint8_t)b);
+      if ( blk != NULL && block_size > 0 ) {
+        sha256_addData(blk, block_size);
+      }
+    }
+  } else if ( app->nfc_protocol == NfcProtocolIso14443_3a ) {
+    const Iso14443_3aData* iso14_data =
+        (const Iso14443_3aData*)nfc_poller_get_data(app->nfc_poller);
+    const uint8_t* uid = iso14443_3a_get_uid(iso14_data, &uid_len);
+    if ( uid != NULL && uid_len > 0 ) {
+      sha256_addData(uid, uid_len);
+    }
+  }
+
+  sha256_finalize(app->key);
 }
 
 // Validator to reject empty or already existing file names in /ext/flipa55/data
@@ -853,6 +1098,32 @@ static bool custom_event_callback(void* context, uint32_t event) {
       return true;
       break;
 
+    case MenuScanNFC:
+      stop_nfc(app);
+      app->nfc_is_writing = false;
+      widget_reset(app->widget);
+      widget_add_text_box_element(app->widget, 0, 0, 128, 64, AlignCenter, AlignCenter, "Scanning NFC...", true);
+      app->current_view = ViewWidget;
+      view_dispatcher_switch_to_view(app->view_dispatcher, ViewWidget);
+
+      app->nfc_scanner = nfc_scanner_alloc(app->nfc);
+      nfc_scanner_start(app->nfc_scanner, nfc_scanner_callback, app);
+      return true;
+      break;
+
+    case MenuCreateNFC:
+      stop_nfc(app);
+      app->nfc_is_writing = true;
+      widget_reset(app->widget);
+      widget_add_text_box_element(app->widget, 0, 0, 128, 64, AlignCenter, AlignCenter, "Writing NFC tag...", true);
+      app->current_view = ViewWidget;
+      view_dispatcher_switch_to_view(app->view_dispatcher, ViewWidget);
+
+      app->nfc_scanner = nfc_scanner_alloc(app->nfc);
+      nfc_scanner_start(app->nfc_scanner, nfc_scanner_callback, app);
+      return true;
+      break;
+
     case MenuSettings:
       app->current_view = ViewSettings;
       view_dispatcher_switch_to_view(app->view_dispatcher, ViewSettings);
@@ -987,6 +1258,7 @@ static bool custom_event_callback(void* context, uint32_t event) {
       // Stop the worker and return to the init menu
       lfrfid_worker_stop(app->rfid_worker);
       lfrfid_worker_stop_thread(app->rfid_worker);
+      stop_nfc(app);
       if ( furi_hal_usb_get_config() == &usb_hid && app->usb_mode_prev != NULL ) {
         furi_hal_usb_set_config(app->usb_mode_prev, NULL);
       }
@@ -1002,10 +1274,18 @@ static bool custom_event_callback(void* context, uint32_t event) {
       return true;
       break;
 
+    case 102:
+      stop_nfc(app);
+      widget_reset(app->widget);
+      widget_add_text_box_element(app->widget, 0, 0, 128, 64, AlignCenter, AlignCenter, "NFC tag write error.\n\nPress back to return to menu.", true);
+      return true;
+      break;
+
     // Custom code for management menu
     case 200:
       lfrfid_worker_stop(app->rfid_worker);
       lfrfid_worker_stop_thread(app->rfid_worker);
+      stop_nfc(app);
       if ( furi_hal_usb_get_config() != &usb_hid ) {
         app->usb_mode_prev = furi_hal_usb_get_config();
         furi_hal_usb_unlock();
@@ -1200,6 +1480,37 @@ static bool custom_event_callback(void* context, uint32_t event) {
       }
       return true;
       break;
+
+    // NFC tag detected by scanner: switch from scanner to poller on main thread
+    case 500:
+      if ( app->nfc_scanner != NULL ) {
+        nfc_scanner_stop(app->nfc_scanner);
+        nfc_scanner_free(app->nfc_scanner);
+        app->nfc_scanner = NULL;
+      }
+      if ( app->nfc_poller != NULL ) {
+        nfc_poller_stop(app->nfc_poller);
+        nfc_poller_free(app->nfc_poller);
+        app->nfc_poller = NULL;
+      }
+      app->nfc_poller = nfc_poller_alloc(app->nfc, app->nfc_protocol);
+      nfc_poller_start(app->nfc_poller, nfc_poller_callback, app);
+      return true;
+      break;
+
+    // NFC tag read complete: derive key, stop poller, and switch to management menu
+    case 501:
+      derive_nfc_key(app);
+      stop_nfc(app);
+      if ( furi_hal_usb_get_config() != &usb_hid ) {
+        app->usb_mode_prev = furi_hal_usb_get_config();
+        furi_hal_usb_unlock();
+        furi_hal_usb_set_config(&usb_hid, NULL);
+      }
+      app->current_view = ViewManageMenu;
+      view_dispatcher_switch_to_view(app->view_dispatcher, ViewManageMenu);
+      return true;
+      break;
   }
 
   return true;
@@ -1283,6 +1594,8 @@ extern "C" int32_t flipa55_main() {
   // Add items to the init menu
   submenu_add_item(app->initmenu, "Scan RFID key", MenuScanRFID, menu_callback, app->view_dispatcher);
   submenu_add_item(app->initmenu, "Create RFID key", MenuCreateRFID, menu_callback, app->view_dispatcher);
+  submenu_add_item(app->initmenu, "Scan NFC key", MenuScanNFC, menu_callback, app->view_dispatcher);
+  submenu_add_item(app->initmenu, "Create NFC key", MenuCreateNFC, menu_callback, app->view_dispatcher);
   submenu_add_item(app->initmenu, "Settings", MenuSettings, menu_callback, app->view_dispatcher);
 
   // Register callbacks for defined events
@@ -1302,6 +1615,14 @@ extern "C" int32_t flipa55_main() {
   // Allocate the RFID dictionary and worker
   app->rfid_dict = protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax);
   app->rfid_worker = lfrfid_worker_alloc(app->rfid_dict);
+
+  // Allocate NFC instance and Ultralight write buffer
+  app->nfc = nfc_alloc();
+  app->nfc_scanner = NULL;
+  app->nfc_poller = NULL;
+  app->mf_ul_write_data = mf_ultralight_alloc();
+  app->nfc_is_writing = false;
+  app->mfc_sector_idx = 0;
 
   // Add the menu to the dispatcher
   view_dispatcher_add_view(app->view_dispatcher, ViewInitmenu, submenu_get_view(app->initmenu));
@@ -1331,6 +1652,9 @@ extern "C" int32_t flipa55_main() {
   if ( furi_hal_usb_get_config() == &usb_hid && app->usb_mode_prev != NULL ) {
     furi_hal_usb_set_config(app->usb_mode_prev, NULL);
   }
+  stop_nfc(app);
+  mf_ultralight_free(app->mf_ul_write_data);
+  nfc_free(app->nfc);
   lfrfid_worker_free(app->rfid_worker);
   protocol_dict_free(app->rfid_dict);
 

@@ -114,12 +114,15 @@ typedef struct {
   char new_file_name[32];
   char username[128];
   char password[127];
+  bool is_editing_file;
 
   FuriHalUsbInterface* usb_mode_prev;
 } AppState;
 
 static void save_new_file(AppState* app);
 static void copy_selected_file(AppState* app);
+static void remove_selected_file(AppState* app);
+static bool load_username_from_file(AppState* app);
 static void decrypt_selected_file(AppState* app);
 
 static bool load_keyboard_layout(AppState* app, const char* path) {
@@ -489,12 +492,18 @@ static void save_new_file(AppState *app) {
   storage_simply_mkdir(storage, "/ext/flipa55");
   storage_simply_mkdir(storage, "/ext/flipa55/data");
 
-  furi_string_printf(app->file_path, "/ext/flipa55/data/%s", app->new_file_name);
+  if ( !app->is_editing_file ) {
+    furi_string_printf(app->file_path, "/ext/flipa55/data/%s", app->new_file_name);
+  }
 
   File* fout = storage_file_alloc(storage);
-  if ( storage_common_exists(storage, furi_string_get_cstr(app->file_path)) ) {
+  if ( !app->is_editing_file && storage_common_exists(storage, furi_string_get_cstr(app->file_path)) ) {
     file_exists = true;
-  } else if ( storage_file_open(fout, furi_string_get_cstr(app->file_path), FSAM_WRITE, FSOM_CREATE_NEW) ) {
+  } else if ( storage_file_open(
+                  fout,
+                  furi_string_get_cstr(app->file_path),
+                  FSAM_WRITE,
+                  app->is_editing_file ? FSOM_CREATE_ALWAYS : FSOM_CREATE_NEW) ) {
     // Generate IV
     furi_hal_random_fill_buf(plaintext, 16);
 
@@ -553,6 +562,54 @@ static void copy_selected_file(AppState* app) {
   if ( file_exists ) view_dispatcher_send_custom_event(app->view_dispatcher, 311);
   else if ( file_op_success ) view_dispatcher_send_custom_event(app->view_dispatcher, 312);
   else view_dispatcher_send_custom_event(app->view_dispatcher, 303);
+}
+
+// Remove selected file from /ext/flipa55/data
+static void remove_selected_file(AppState* app) {
+  Storage* storage = (Storage*)furi_record_open(RECORD_STORAGE);
+  bool file_op_success = false;
+
+  app->current_view = ViewLoading;
+  view_dispatcher_switch_to_view(app->view_dispatcher, ViewLoading);
+
+  if ( storage_common_remove(storage, furi_string_get_cstr(app->file_path)) == FSE_OK ) {
+    file_op_success = true;
+  }
+
+  furi_record_close(RECORD_STORAGE);
+
+  if ( file_op_success ) view_dispatcher_send_custom_event(app->view_dispatcher, 313);
+  else view_dispatcher_send_custom_event(app->view_dispatcher, 303);
+}
+
+// Read only the plaintext username line from the selected file without decrypting
+static bool load_username_from_file(AppState* app) {
+  Storage* storage = (Storage*)furi_record_open(RECORD_STORAGE);
+  bool file_op_success = false;
+
+  memset(app->username, 0, sizeof(app->username));
+
+  File* fin = storage_file_alloc(storage);
+  if ( storage_file_open(fin, furi_string_get_cstr(app->file_path), FSAM_READ, FSOM_OPEN_EXISTING) ) {
+    if ( storage_file_size(fin) != 0 ) {
+      size_t i = 0;
+      char ch = 0;
+      while ( i < sizeof(app->username) - 1 && storage_file_read(fin, &ch, 1) == 1 ) {
+        if ( ch == '\n' ) {
+          break;
+        }
+        app->username[i++] = ch;
+      }
+      app->username[i] = '\0';
+      file_op_success = true;
+    }
+  }
+
+  storage_file_close(fin);
+  storage_file_free(fin);
+  furi_record_close(RECORD_STORAGE);
+
+  return file_op_success;
 }
 
 // Decrypt selected file and load data into the app state
@@ -679,6 +736,7 @@ static bool custom_event_callback(void* context, uint32_t event) {
       break;
 
     case MenuCreateFile:
+      app->is_editing_file = false;
       memset(app->new_file_name, 0, sizeof(app->new_file_name));
       text_input_reset(app->text_input);
       text_input_set_header_text(app->text_input, "Enter file name:");
@@ -711,6 +769,53 @@ static bool custom_event_callback(void* context, uint32_t event) {
 
         app->current_view = ViewTextInput;
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextInput);
+      }
+      return true;
+      break;
+
+    case MenuEditFile:
+      dialogs = (DialogsApp*)furi_record_open(RECORD_DIALOGS);
+      DialogsFileBrowserOptions edit_browser_options;
+
+      dialog_file_browser_set_basic_options(&edit_browser_options, "*", NULL);
+
+      furi_string_set_str(app->file_path, "/ext/flipa55/data");
+
+      success = dialog_file_browser_show(dialogs, app->file_path, app->file_path, &edit_browser_options);
+
+      furi_record_close(RECORD_DIALOGS);
+
+      if ( success ) {
+        app->is_editing_file = true;
+        if ( load_username_from_file(app) ) {
+          text_input_reset(app->text_input);
+          text_input_set_validator(app->text_input, NULL, NULL);
+          text_input_set_header_text(app->text_input, "Enter username:");
+          text_input_set_result_callback(app->text_input, username_input_callback, app, app->username, sizeof(app->username), false);
+
+          app->current_view = ViewTextInput;
+          view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextInput);
+        } else {
+          view_dispatcher_send_custom_event(app->view_dispatcher, 303);
+        }
+      }
+      return true;
+      break;
+
+    case MenuRemoveFile:
+      dialogs = (DialogsApp*)furi_record_open(RECORD_DIALOGS);
+      DialogsFileBrowserOptions remove_browser_options;
+
+      dialog_file_browser_set_basic_options(&remove_browser_options, "*", NULL);
+
+      furi_string_set_str(app->file_path, "/ext/flipa55/data");
+
+      success = dialog_file_browser_show(dialogs, app->file_path, app->file_path, &remove_browser_options);
+
+      furi_record_close(RECORD_DIALOGS);
+
+      if ( success ) {
+        remove_selected_file(app);
       }
       return true;
       break;
@@ -816,6 +921,16 @@ static bool custom_event_callback(void* context, uint32_t event) {
     case 312:
       widget_reset(app->status_widget);
       widget_add_text_box_element(app->status_widget, 0, 0, 128, 64, AlignCenter, AlignCenter, "File copied\nPress back to return to menu.", true);
+
+      app->current_view = ViewStatusWidget;
+      view_dispatcher_switch_to_view(app->view_dispatcher, ViewStatusWidget);
+      return true;
+      break;
+
+    // File remove succeeded
+    case 313:
+      widget_reset(app->status_widget);
+      widget_add_text_box_element(app->status_widget, 0, 0, 128, 64, AlignCenter, AlignCenter, "File removed\nPress back to return to menu.", true);
 
       app->current_view = ViewStatusWidget;
       view_dispatcher_switch_to_view(app->view_dispatcher, ViewStatusWidget);
@@ -967,6 +1082,7 @@ extern "C" int32_t flipa55_main() {
   app->layout_path = furi_string_alloc();
   app->layout_name = furi_string_alloc();
   app->text_input = text_input_alloc();
+  app->is_editing_file = false;
   app->usb_mode_prev = furi_hal_usb_get_config();
 
   // Configure settings list

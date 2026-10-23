@@ -433,13 +433,6 @@ static void rfid_read_callback(LFRFIDWorkerReadResult read_result, ProtocolId pr
     sha256_addData( (unsigned const char*)furi_string_get_cstr(parsed_data), furi_string_size(parsed_data) );
     sha256_finalize(app->key);
 
-    furi_string_reset(parsed_data);
-    for ( size_t i = 0; i < sizeof(app->key); i++ ) {
-      furi_string_cat_printf(parsed_data, "%02X", app->key[i]);
-    }
-    FURI_LOG_I("Flipa55", "Key: %s", furi_string_get_cstr(parsed_data));
-
-    furi_string_free(parsed_data);
 
     view_dispatcher_send_custom_event(app->view_dispatcher, 200);
 
